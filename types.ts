@@ -24,7 +24,8 @@ export interface AffinityState {
   level: number;
   abilities: string[];
   negativeStats: number;
-  aspirations: Aspiration[]; // New: Devotion Engine
+  aspirations: Aspiration[];
+  unlockedAchievements: string[]; // New: Track IDs
 }
 
 export interface Aspiration {
@@ -32,6 +33,14 @@ export interface Aspiration {
   goal: string;
   progress: number; // 0-100
   notes: string;
+}
+
+export interface Achievement {
+  id: string;
+  title: string;
+  description: string;
+  icon: string;
+  condition: (state: { messages: Message[], affinity: AffinityState, currency: number }) => boolean;
 }
 
 export interface Checkpoint {
@@ -42,7 +51,7 @@ export interface Checkpoint {
   currency: number;
   prestige: number;
   inventory: string[];
-  foxBag: FoxLogItem[]; // New: Save Fox quotes
+  foxBag: FoxLogItem[]; 
 }
 
 export interface Settings {
@@ -75,11 +84,12 @@ export interface StoreItem {
 
 export enum MoEType {
   NONE = 'NONE',
-  REVIEWER = 'REVIEWER', // Now acts as Researcher/Searcher
+  REVIEWER = 'REVIEWER', 
   ALIEN = 'ALIEN',
   FOX = 'FOX',
   URGENT = 'URGENT',
-  DEVOTED = 'DEVOTED'
+  DEVOTED = 'DEVOTED',
+  THERAPIST = 'THERAPIST' // New
 }
 
 export interface AIResponseSchema {
@@ -89,5 +99,6 @@ export interface AIResponseSchema {
   fox_tip?: string;
   affinity_delta: number;
   oit?: { o: number; i: number; t: number };
-  aspirations_update?: Aspiration[]; // New: AI can update user goals
+  aspirations_update?: Aspiration[];
+  image_prompt?: string; // New: Agent can request an image
 }

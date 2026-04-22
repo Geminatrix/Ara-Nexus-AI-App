@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import VisualSynth from './components/VisualSynth';
 import SettingsPanel from './components/SettingsPanel';
 import { generateResponse, generateSpeech, generateImage } from './services/geminiService';
+import { LiveSession } from './services/liveService';
 import { Message, AffinityState, Settings, Checkpoint, MoEType, FoxTip, StoreItem, FoxLogItem, Aspiration } from './types';
 import { 
   INITIAL_AFFINITY_SCORE, 
@@ -10,7 +11,8 @@ import {
   INITIAL_STORE_ITEMS,
   UNLOCK_CUSTOM_THRESHOLD,
   MAX_TIER_PRESTIGE_THRESHOLD,
-  MAX_CUSTOM_CHARS
+  MAX_CUSTOM_CHARS,
+  ACHIEVEMENTS_LIST
 } from './constants';
 
 const App: React.FC = () => {
@@ -27,6 +29,7 @@ const App: React.FC = () => {
   const [isImageGenMode, setIsImageGenMode] = useState(false);
   const [imageSize, setImageSize] = useState<'1K' | '2K' | '4K'>('1K');
   const [foxBag, setFoxBag] = useState<FoxLogItem[]>([]);
+  const [isLiveMode, setIsLiveMode] = useState(false);
   
   // Progression
   const [affinity, setAffinity] = useState<AffinityState>({
@@ -34,7 +37,8 @@ const App: React.FC = () => {
     level: 1,
     abilities: [],
     negativeStats: 0,
-    aspirations: [] // Devotion Engine State
+    aspirations: [],
+    unlockedAchievements: []
   });
   const [currency, setCurrency] = useState(0);
   const [prestigeLevel, setPrestigeLevel] = useState(0);
@@ -47,6 +51,7 @@ const App: React.FC = () => {
     devMode: true,
     instructionLength: 'regular'
   });
+  const [autoSaveEnabled, setAutoSaveEnabled] = useState(false);
   const [customInstructions, setCustomInstructions] = useState('');
   
   // UI Panels
@@ -59,6 +64,7 @@ const App: React.FC = () => {
   const [isFoxInventoryOpen, setIsFoxInventoryOpen] = useState(false);
   const [isSearchOverlayOpen, setIsSearchOverlayOpen] = useState(false);
   const [isDevotionWidgetOpen, setIsDevotionWidgetOpen] = useState(false);
+  const [isAchievementWidgetOpen, setIsAchievementWidgetOpen] = useState(false);
   const [isCustomPanelOpen, setIsCustomPanelOpen] = useState(false);
   
   const [checkpoints, setCheckpoints] = useState<Checkpoint[]>([]);
@@ -66,6 +72,7 @@ const App: React.FC = () => {
   const [foxTip, setFoxTip] = useState<FoxTip>({ text: '', visible: false });
   const [activeMoE, setActiveMoE] = useState<MoEType>(MoEType.NONE);
   const [masterHiddenOpen, setMasterHiddenOpen] = useState(false);
+  const [newAchievement, setNewAchievement] = useState<string | null>(null);
 
   // Audio & Refs
   const [playingMessageId, setPlayingMessageId] = useState<string | null>(null);
@@ -73,12 +80,39 @@ const App: React.FC = () => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const liveSessionRef = useRef<LiveSession | null>(null);
 
   // --- Effects ---
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, foxTip.visible, selectedImage]);
+
+  // Handle Live Mode
+  useEffect(() => {
+      if (isLiveMode) {
+          if (!liveSessionRef.current) {
+              liveSessionRef.current = new LiveSession((status) => {
+                  if (!status) setIsLiveMode(false);
+              });
+              liveSessionRef.current.connect(activeMoE).catch(err => {
+                  addLog(`Live Connect Failed: ${err}`);
+                  setIsLiveMode(false);
+              });
+          }
+      } else {
+          if (liveSessionRef.current) {
+              liveSessionRef.current.disconnect();
+              liveSessionRef.current = null;
+          }
+      }
+      return () => {
+          if (liveSessionRef.current) {
+              liveSessionRef.current.disconnect();
+              liveSessionRef.current = null;
+          }
+      };
+  }, [isLiveMode, activeMoE]); // Reconnect if persona changes? No, simplify: disconnect to change persona.
 
   // Load Persistence
   useEffect(() => {
@@ -89,6 +123,7 @@ const App: React.FC = () => {
     const savedItems = localStorage.getItem('ea_store');
     const savedSettings = localStorage.getItem('ea_settings');
     const savedFoxBag = localStorage.getItem('ea_foxbag');
+    const savedAutoSave = localStorage.getItem('ea_autosave');
     
     if (savedAffinity) setAffinity(JSON.parse(savedAffinity));
     if (savedCheckpoints) setCheckpoints(JSON.parse(savedCheckpoints));
@@ -97,6 +132,7 @@ const App: React.FC = () => {
     if (savedItems) setStoreItems(JSON.parse(savedItems));
     if (savedSettings) setSettings(JSON.parse(savedSettings));
     if (savedFoxBag) setFoxBag(JSON.parse(savedFoxBag));
+    if (savedAutoSave) setAutoSaveEnabled(JSON.parse(savedAutoSave));
   }, []);
 
   // Save Persistence
@@ -107,6 +143,40 @@ const App: React.FC = () => {
   useEffect(() => { localStorage.setItem('ea_store', JSON.stringify(storeItems)); }, [storeItems]);
   useEffect(() => { localStorage.setItem('ea_settings', JSON.stringify(settings)); }, [settings]);
   useEffect(() => { localStorage.setItem('ea_foxbag', JSON.stringify(foxBag)); }, [foxBag]);
+  useEffect(() => { localStorage.setItem('ea_autosave', JSON.stringify(autoSaveEnabled)); }, [autoSaveEnabled]);
+
+  // Auto-Save Logic (Every 5 messages if enabled)
+  useEffect(() => {
+      if (autoSaveEnabled && messages.length > 5 && messages.length % 5 === 0) {
+          handleQuickSave(true);
+      }
+  }, [messages.length, autoSaveEnabled]);
+
+  // Achievement Check Loop
+  useEffect(() => {
+     const hasAchievementSys = storeItems.find(i => i.id === 'achievement_sys')?.purchased;
+     if (!hasAchievementSys) return;
+
+     let newlyUnlocked: string | null = null;
+     const updatedUnlocked = [...(affinity.unlockedAchievements || [])];
+     
+     ACHIEVEMENTS_LIST.forEach(ach => {
+         if (!updatedUnlocked.includes(ach.id)) {
+             if (ach.condition({ messages, affinity, currency })) {
+                 updatedUnlocked.push(ach.id);
+                 newlyUnlocked = ach.title;
+             }
+         }
+     });
+
+     if (newlyUnlocked) {
+         setAffinity(prev => ({ ...prev, unlockedAchievements: updatedUnlocked }));
+         setNewAchievement(newlyUnlocked);
+         setTimeout(() => setNewAchievement(null), 4000);
+         addLog(`Achievement Unlocked: ${newlyUnlocked}`);
+     }
+  }, [messages, affinity, currency, storeItems]);
+
 
   // --- Logic Helpers ---
 
@@ -220,12 +290,10 @@ const App: React.FC = () => {
 
   // --- Handlers ---
 
-  const handleNewChat = () => {
-    if (messages.length > 1) {
-        const saveName = window.prompt("Save Session?", `Session_${new Date().toLocaleTimeString()}`);
-        if (saveName === null) return;
-        const finalName = saveName.trim() || `AutoSave_${Date.now()}`;
-        const newCp: Checkpoint = {
+  const handleQuickSave = (silent = false) => {
+      const timestamp = new Date().toLocaleTimeString();
+      const finalName = `AutoSave_${timestamp}`;
+      const newCp: Checkpoint = {
             name: finalName,
             timestamp: Date.now(),
             affinity: { ...affinity },
@@ -234,9 +302,16 @@ const App: React.FC = () => {
             prestige: prestigeLevel,
             inventory: storeItems.filter(i => i.purchased).map(i => i.id),
             foxBag: [...foxBag]
-        };
-        setCheckpoints(prev => [...prev, newCp]);
-        addLog(`Session archived: ${finalName}`);
+      };
+      setCheckpoints(prev => [newCp, ...prev].slice(0, 20)); // Keep last 20
+      if (!silent) addLog(`Data_bank updated: ${finalName}`);
+  };
+
+  const handleNewChat = () => {
+    if (messages.length > 1) {
+        if (window.confirm("Save current session to Data_banks before clearing?")) {
+            handleQuickSave();
+        }
     }
     setMessages([{ id: Date.now().toString(), role: 'system', content: 'Buffer cleared. New session initialized.', timestamp: Date.now() }]);
     setStopSignal(false);
@@ -276,7 +351,34 @@ const App: React.FC = () => {
   };
 
   const handleCommand = (text: string): boolean => {
-    if (text === '/MasterHidden') { setMasterHiddenOpen(true); return true; }
+    if (text === '/MasterHidden') { 
+        setMasterHiddenOpen(true); 
+        return true; 
+    }
+    
+    // Parametric Commands
+    if (text.startsWith('/MasterHidden')) {
+        const parts = text.split(' ');
+        // /MasterHidden Money 500
+        if (parts[1]?.toLowerCase() === 'money') {
+            const val = parseInt(parts[2]);
+            if (!isNaN(val)) {
+                setCurrency(prev => prev + val);
+                addLog(`MASTER_CMD: Added ${val} Credits`);
+                return true;
+            }
+        }
+        // /MasterHidden set-affinity 100
+        if (parts[1]?.toLowerCase() === 'set-affinity') {
+            const val = parseFloat(parts[2]);
+            if (!isNaN(val)) {
+                setAffinity(prev => ({...prev, score: Math.min(100, Math.max(0, val))}));
+                addLog(`MASTER_CMD: Affinity set to ${val}%`);
+                return true;
+            }
+        }
+    }
+
     if (text === '/guidance') { setIsCustomPanelOpen(true); return true; }
     return false;
   };
@@ -329,7 +431,6 @@ const App: React.FC = () => {
 
       updateAffinityAndCurrency(data.affinity_delta, data.oit);
 
-      // Handle Aspirations Update
       if (data.aspirations_update) {
          setAffinity(prev => {
              const newGoals = [...prev.aspirations];
@@ -343,14 +444,12 @@ const App: React.FC = () => {
          addLog(`Aspiration Engine Updated`);
       }
 
-      // Fox Logic
       if ((currentMoE === MoEType.FOX || data.fox_tip) && data.fox_tip) {
          setFoxTip({ text: data.fox_tip, visible: true });
          const newFoxLog = { id: Date.now().toString(), text: data.fox_tip, timestamp: Date.now() };
          setFoxBag(prev => [newFoxLog, ...prev]);
       }
 
-      // Search Logic
       if (groundingSources && groundingSources.length > 0) {
           setIsSearchOverlayOpen(true);
       }
@@ -369,6 +468,27 @@ const App: React.FC = () => {
       };
 
       setMessages(prev => [...prev, modelMsg]);
+      
+      // AUTO IMAGE GENERATION HANDLER
+      if (data.image_prompt) {
+           setIsProcessing(true);
+           addLog("AUTONOMOUS VISUAL PROTOCOL INITIATED");
+           const { imageBase64, error } = await generateImage(data.image_prompt, '1K');
+           if (imageBase64) {
+               setMessages(prev => [...prev, { 
+                    id: (Date.now() + 2).toString(), 
+                    role: 'model', 
+                    content: `VISUAL DATA RENDERED: ${data.image_prompt}`, 
+                    timestamp: Date.now(),
+                    image: imageBase64,
+                    ritual: "Visual Synth Complete"
+                }]);
+           } else {
+               addLog(`Auto-Image Failed: ${error}`);
+           }
+           setIsProcessing(false);
+      }
+
       if (settings.voiceMode) {
            const audioBase64 = await generateSpeech(data.response.substring(0, 300));
            if (audioBase64) await playAudio(audioBase64);
@@ -391,6 +511,7 @@ const App: React.FC = () => {
          </div>
          <div className="flex-1 overflow-y-auto p-2 space-y-2">
             <button onClick={() => setActivePanel('folder')} className={`w-full p-2 rounded hover:bg-gray-800 flex items-center ${isLeftSidebarOpen ? 'justify-start gap-3' : 'justify-center'}`} title="Saved Data"><span>📂</span> {isLeftSidebarOpen && <span className="text-sm font-mono text-gray-300">DATA_BANKS</span>}</button>
+            <button onClick={() => handleQuickSave(false)} className={`w-full p-2 rounded hover:bg-gray-800 flex items-center ${isLeftSidebarOpen ? 'justify-start gap-3' : 'justify-center'}`} title="Quick Save"><span>💾</span> {isLeftSidebarOpen && <span className="text-sm font-mono text-gray-300">QUICK_SAVE</span>}</button>
             <button onClick={handleNewChat} className={`w-full p-2 rounded hover:bg-gray-800 flex items-center ${isLeftSidebarOpen ? 'justify-start gap-3' : 'justify-center'}`} title="New Chat"><span>💬</span> {isLeftSidebarOpen && <span className="text-sm font-mono text-gray-300">NEW_SESSION</span>}</button>
             <button onClick={() => setActivePanel('store')} className={`w-full p-2 rounded hover:bg-gray-800 flex items-center ${isLeftSidebarOpen ? 'justify-start gap-3' : 'justify-center'}`} title="Marketplace"><span>🛒</span> {isLeftSidebarOpen && <span className="text-sm font-mono text-gray-300">MARKETPLACE</span>}</button>
             <button onClick={() => setActivePanel('settings')} className={`w-full p-2 rounded hover:bg-gray-800 flex items-center ${isLeftSidebarOpen ? 'justify-start gap-3' : 'justify-center'}`} title="Settings"><span>⚙️</span> {isLeftSidebarOpen && <span className="text-sm font-mono text-gray-300">SYS_CONFIG</span>}</button>
@@ -401,6 +522,11 @@ const App: React.FC = () => {
                    <button onClick={() => setIsFoxInventoryOpen(true)} className="w-full text-left text-xs font-mono text-orange-400 p-2 hover:bg-gray-900 rounded border border-transparent hover:border-orange-500/30 transition-all">🎒 FOX_INVENTORY</button>
                    <button onClick={() => setIsDevotionWidgetOpen(true)} className="w-full text-left text-xs font-mono text-pink-400 p-2 hover:bg-gray-900 rounded border border-transparent hover:border-pink-500/30 transition-all">❤️ ASPIRATION_ENGINE</button>
                    <button onClick={() => setIsSearchOverlayOpen(true)} className="w-full text-left text-xs font-mono text-purple-400 p-2 hover:bg-gray-900 rounded border border-transparent hover:border-purple-500/30 transition-all">🕵️ LIVE_SEARCH_FEED</button>
+                   
+                   {/* Unlockable Achievement Button */}
+                   {storeItems.find(i => i.id === 'achievement_sys')?.purchased && (
+                       <button onClick={() => setIsAchievementWidgetOpen(true)} className="w-full text-left text-xs font-mono text-yellow-400 p-2 hover:bg-gray-900 rounded border border-transparent hover:border-yellow-500/30 transition-all">🏆 ACHIEVEMENTS</button>
+                   )}
                </div>
             )}
 
@@ -422,20 +548,35 @@ const App: React.FC = () => {
 
       {/* CENTER */}
       <div className="flex-1 flex flex-col min-w-0 relative bg-[#050505]">
-        {/* Compact Header */}
+        {/* Compact Header - Deep Thought Toggle Integration */}
         <div className="flex justify-between items-center p-2 bg-gray-950 border-b border-gray-800 text-[10px] font-mono text-gray-500">
             <div className="flex items-center gap-3">
               <button onClick={() => setIsVisualSynthOpen(!isVisualSynthOpen)} className="hover:text-cyan-400 flex items-center gap-1 transition-colors">{isVisualSynthOpen ? '👁️ HIDE' : '👁️ SHOW'}</button>
               <button onClick={() => setIsCustomPanelOpen(true)} className="hover:text-cyan-400 ml-2">+GUIDE</button>
+              <label className="flex items-center gap-1 cursor-pointer hover:text-cyan-300">
+                  <input type="checkbox" checked={autoSaveEnabled} onChange={(e) => setAutoSaveEnabled(e.target.checked)} className="accent-cyan-500 h-3 w-3" />
+                  <span>AUTOSAVE</span>
+              </label>
             </div>
             <div className="flex items-center gap-3">
-               {settings.voiceMode && <span className="text-emerald-500 animate-pulse">🔊 VOICE</span>}
-               {settings.showThinking && <span className="text-purple-500 animate-pulse">🧠 DEEP_THOUGHT</span>}
-               <span>CPU: {isProcessing ? 'BUSY' : 'IDLE'}</span>
+               {isLiveMode && <span className="text-red-500 animate-pulse font-bold tracking-widest">● LIVE_NET</span>}
+               {settings.voiceMode && !isLiveMode && <span className="text-emerald-500 animate-pulse">🔊 VOICE</span>}
+               
+               {/* Clickable Neural Stream Toggle */}
+               <button 
+                  onClick={() => setIsRightSidebarOpen(!isRightSidebarOpen)} 
+                  className={`flex items-center gap-1 transition-all ${isRightSidebarOpen ? 'text-purple-400' : 'text-gray-600 hover:text-purple-400'}`}
+                  title="Toggle Neural Stream Sidebar"
+               >
+                   <span className={settings.showThinking ? "animate-pulse" : ""}>🧠</span> 
+                   <span className="font-bold">{settings.showThinking ? "DEEP_THOUGHT" : "NEURAL_STREAM"}</span>
+               </button>
+
+               <span>CPU: {isProcessing || isLiveMode ? 'BUSY' : 'IDLE'}</span>
             </div>
         </div>
 
-        {isVisualSynthOpen && <VisualSynth isActive={isProcessing} voiceMode={settings.voiceMode} affinity={affinity.score} />}
+        {isVisualSynthOpen && <VisualSynth isActive={isProcessing || isLiveMode} voiceMode={settings.voiceMode || isLiveMode} affinity={affinity.score} activeMoE={activeMoE} />}
         
         {/* Custom Guidance Modal */}
         {isCustomPanelOpen && (
@@ -457,7 +598,33 @@ const App: React.FC = () => {
             </div>
         )}
 
-        {/* Devotion Widget Modal (Responsive Fix) */}
+        {/* Achievement Modal */}
+        {isAchievementWidgetOpen && (
+            <div className="absolute inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+                 <div className="bg-yellow-950/20 border border-yellow-500/50 w-full max-w-lg max-h-[80vh] flex flex-col rounded-lg p-6 shadow-2xl animate-in fade-in zoom-in-95">
+                     <div className="flex justify-between items-center mb-6">
+                        <div className="flex items-center gap-2"><span className="text-2xl">🏆</span><h3 className="text-yellow-400 font-bold font-mono">ACHIEVEMENT_PROTOCOL</h3></div>
+                        <button onClick={() => setIsAchievementWidgetOpen(false)} className="text-yellow-500 hover:text-white">✕</button>
+                    </div>
+                    <div className="grid grid-cols-1 gap-2 overflow-y-auto custom-scrollbar pr-2">
+                        {ACHIEVEMENTS_LIST.map((ach) => {
+                            const isUnlocked = affinity.unlockedAchievements?.includes(ach.id);
+                            return (
+                                <div key={ach.id} className={`p-3 rounded border flex items-center gap-4 ${isUnlocked ? 'bg-yellow-900/20 border-yellow-500/50' : 'bg-gray-900/50 border-gray-800 opacity-50 grayscale'}`}>
+                                    <div className="text-2xl">{ach.icon}</div>
+                                    <div>
+                                        <div className={`text-sm font-bold ${isUnlocked ? 'text-yellow-200' : 'text-gray-500'}`}>{ach.title}</div>
+                                        <div className="text-xs text-gray-400">{ach.description}</div>
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                 </div>
+            </div>
+        )}
+
+        {/* Devotion Widget Modal */}
         {isDevotionWidgetOpen && (
             <div className="absolute inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
                 <div className="bg-pink-950/20 border border-pink-500/50 w-full max-w-2xl max-h-[85vh] flex flex-col rounded-lg p-6 shadow-2xl animate-in fade-in zoom-in-95">
@@ -535,9 +702,36 @@ const App: React.FC = () => {
                              <button onClick={() => handleCopyToClipboard(msg.content)} className="text-[10px] px-2 py-0.5 rounded border bg-transparent text-gray-500 border-gray-800 hover:text-cyan-400 hover:border-cyan-600">📋 COPY MD</button>
                         </div>
 
-                        <div className="flex gap-2">
-                            <button onClick={() => handleFeedback(msg.id, 'up')} disabled={!!msg.feedback} className={`text-[10px] px-2 border border-green-900 rounded bg-green-900/20 text-green-500 hover:bg-green-900/50 ${msg.feedback ? 'opacity-30' : ''}`} title="Reinforce Loop">♻️ REINFORCE</button>
-                            <button onClick={() => handleFeedback(msg.id, 'down')} disabled={!!msg.feedback} className={`text-[10px] px-2 border border-red-900 rounded bg-red-900/20 text-red-500 hover:bg-red-900/50 ${msg.feedback ? 'opacity-30' : ''}`} title="Diverge Loop">🛑 DIVERGE</button>
+                        {/* Updated Subtle Feedback Icons */}
+                        <div className="flex gap-2 items-center">
+                            <button 
+                                onClick={() => handleFeedback(msg.id, 'up')} 
+                                disabled={!!msg.feedback} 
+                                className={`flex items-center justify-center w-6 h-6 rounded-full transition-all duration-200 ${
+                                    msg.feedback === 'up' 
+                                    ? 'bg-green-900/30 text-green-400 shadow-[0_0_10px_rgba(74,222,128,0.2)]' 
+                                    : msg.feedback 
+                                        ? 'text-gray-800 opacity-20' 
+                                        : 'text-gray-600 hover:text-green-400 hover:bg-green-900/10'
+                                }`} 
+                                title="Reinforce Loop (+Affinity)"
+                            >
+                                👍
+                            </button>
+                            <button 
+                                onClick={() => handleFeedback(msg.id, 'down')} 
+                                disabled={!!msg.feedback} 
+                                className={`flex items-center justify-center w-6 h-6 rounded-full transition-all duration-200 ${
+                                    msg.feedback === 'down' 
+                                    ? 'bg-red-900/30 text-red-400 shadow-[0_0_10px_rgba(248,113,113,0.2)]' 
+                                    : msg.feedback 
+                                        ? 'text-gray-800 opacity-20' 
+                                        : 'text-gray-600 hover:text-red-400 hover:bg-red-900/10'
+                                }`} 
+                                title="Diverge Loop (-Affinity)"
+                            >
+                                👎
+                            </button>
                         </div>
                     </div>
                 )}
@@ -556,6 +750,17 @@ const App: React.FC = () => {
           <div ref={messagesEndRef} />
         </div>
 
+        {/* Notifications */}
+        {newAchievement && (
+            <div className="absolute top-16 left-1/2 -translate-x-1/2 bg-yellow-900/90 border border-yellow-500 p-4 rounded-xl shadow-2xl flex items-center gap-4 animate-in slide-in-from-top-10 fade-in zoom-in z-50">
+                <div className="text-3xl">🏆</div>
+                <div>
+                    <div className="text-xs text-yellow-300 font-mono font-bold uppercase tracking-wide">Achievement Unlocked</div>
+                    <div className="text-white font-bold">{newAchievement}</div>
+                </div>
+            </div>
+        )}
+        
         {/* Fox Popup (Active) */}
         {foxTip.visible && (<div className="absolute bottom-32 right-8 max-w-xs animate-in slide-in-from-bottom-5 fade-in duration-300 bg-orange-950/95 text-orange-200 p-4 rounded-xl border border-orange-500/50 shadow-2xl z-30 backdrop-blur-md"><div className="absolute -top-4 -left-4 text-3xl bg-black rounded-full p-1 border border-orange-900">🦊</div><p className="text-sm font-bold italic pl-2">"{foxTip.text}"</p><div className="text-[9px] text-orange-500/60 mt-2 text-right">SAVED TO FOX BAG</div><button onClick={() => setFoxTip({text:'', visible:false})} className="absolute top-1 right-2 text-xs text-orange-500 hover:text-white">✕</button></div>)}
 
@@ -566,18 +771,20 @@ const App: React.FC = () => {
           <div className="mb-3">
              <div className="text-[10px] text-gray-500 font-mono mb-2 flex justify-between items-center">
                 <span>ACTIVE_AGENT_PROTOCOL</span>
-                {activeMoE !== MoEType.NONE && <button onClick={() => setActiveMoE(MoEType.NONE)} className="text-xs text-red-500 hover:text-red-300">RESET</button>}
+                {activeMoE !== MoEType.NONE && <button onClick={() => !isLiveMode && setActiveMoE(MoEType.NONE)} className="text-xs text-red-500 hover:text-red-300">RESET</button>}
              </div>
-             <div className="flex gap-2">
+             <div className="flex gap-2 flex-wrap">
                  {[
                     { type: MoEType.NONE, icon: '🤖', color: 'gray', label: 'ARA' },
                     { type: MoEType.REVIEWER, icon: '🕵️', color: 'purple', label: 'RSRCH' },
                     { type: MoEType.ALIEN, icon: '👽', color: 'emerald', label: 'ALIEN' },
                     { type: MoEType.FOX, icon: '🦊', color: 'orange', label: 'FOX' },
                     { type: MoEType.URGENT, icon: '🔥', color: 'red', label: 'FAST' },
-                    { type: MoEType.DEVOTED, icon: '❤️‍🔥', color: 'pink', label: 'LOVE' }
-                 ].map((agent) => (
-                    <button key={agent.type} onClick={() => { setActiveMoE(agent.type as MoEType); addLog(`Switched to ${agent.label}`); }} className={`relative flex items-center justify-center w-10 h-10 rounded-md border-2 transition-all duration-200 ${activeMoE === agent.type ? `bg-${agent.color}-900/40 border-${agent.color}-500 shadow-[0_0_10px_rgba(var(--color-${agent.color}),0.5)] scale-110 z-10` : 'bg-gray-900 border-gray-700 opacity-60 hover:opacity-100 hover:border-gray-500 hover:scale-105'}`} title={agent.label}>
+                    { type: MoEType.DEVOTED, icon: '❤️‍🔥', color: 'pink', label: 'LOVE' },
+                    // Conditional Render for Therapist
+                    storeItems.find(i => i.id === 'cognitive_lattice')?.purchased ? { type: MoEType.THERAPIST, icon: '🧘', color: 'cyan', label: 'MIND' } : null
+                 ].filter(Boolean).map((agent) => (
+                    agent && <button key={agent.type} disabled={isLiveMode && activeMoE !== agent.type} onClick={() => { setActiveMoE(agent.type as MoEType); addLog(`Switched to ${agent.label}`); }} className={`relative flex items-center justify-center w-10 h-10 rounded-md border-2 transition-all duration-200 ${activeMoE === agent.type ? `bg-${agent.color}-900/40 border-${agent.color}-500 shadow-[0_0_10px_rgba(var(--color-${agent.color}),0.5)] scale-110 z-10` : 'bg-gray-900 border-gray-700 opacity-60 hover:opacity-100 hover:border-gray-500 hover:scale-105'}`} title={agent.label}>
                         <span className="text-xl">{agent.icon}</span>
                         {activeMoE === agent.type && <span className={`absolute -bottom-4 text-[8px] font-mono text-${agent.color}-400 font-bold tracking-widest`}>{agent.label}</span>}
                     </button>
@@ -595,38 +802,46 @@ const App: React.FC = () => {
           )}
 
           <div className="flex gap-2 relative mt-4">
-            {/* Thinking / Deep Thought Toggle - Unified */}
+            {/* Live Mode Toggle */}
+             <button
+                onClick={() => setIsLiveMode(!isLiveMode)}
+                className={`px-3 border rounded transition-colors ${isLiveMode ? 'bg-red-600 border-red-400 text-white shadow-[0_0_15px_rgba(239,68,68,0.6)] animate-pulse' : 'bg-gray-900 border-gray-700 text-gray-400 hover:text-red-400 hover:border-red-500'}`}
+                title={isLiveMode ? "End Live Session" : "Start Live Session"}
+            >🎙️</button>
+
+            {/* Thinking Mode Toggle (Functionality Only) */}
             <button
                 onClick={() => setSettings(s => ({...s, showThinking: !s.showThinking}))}
-                className={`px-3 border rounded transition-colors ${settings.showThinking ? 'bg-purple-600 border-purple-400 text-white shadow-[0_0_15px_rgba(168,85,247,0.6)] animate-pulse-slow' : 'bg-gray-900 border-gray-700 text-gray-400 hover:text-purple-400 hover:border-purple-500'}`}
-                title="Deep Thought / CoT"
-            >🧠</button>
+                className={`px-3 border rounded transition-colors ${settings.showThinking ? 'bg-purple-600 border-purple-400 text-white shadow-[0_0_15px_rgba(168,85,247,0.6)]' : 'bg-gray-900 border-gray-700 text-gray-400 hover:text-purple-400 hover:border-purple-500'}`}
+                title={settings.showThinking ? "Deep Thought Active (High Precision)" : "Standard Mode (Fast)"}
+                disabled={isLiveMode}
+            >⚡</button>
 
             {/* Image Gen Toggle */}
-            <button onClick={() => setIsImageGenMode(!isImageGenMode)} className={`px-3 border rounded transition-colors ${isImageGenMode ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-gray-900 border-gray-700 text-gray-400 hover:text-indigo-400 hover:border-indigo-500'}`} title="Generate Image">🎨</button>
+            <button onClick={() => setIsImageGenMode(!isImageGenMode)} className={`px-3 border rounded transition-colors ${isImageGenMode ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-gray-900 border-gray-700 text-gray-400 hover:text-indigo-400 hover:border-indigo-500'}`} title="Generate Image" disabled={isLiveMode}>🎨</button>
 
             {/* File Upload */}
             <input type="file" ref={fileInputRef} onChange={(e) => { if(e.target.files?.[0]){ const r = new FileReader(); r.onload = (ev) => setSelectedImage(ev.target?.result as string); r.readAsDataURL(e.target.files[0]); } }} accept="image/*" className="hidden" />
-            <button onClick={() => fileInputRef.current?.click()} className="px-3 bg-gray-900 border border-gray-700 text-gray-400 rounded hover:text-cyan-400 hover:border-cyan-500 transition-colors" title="Upload Image" disabled={isImageGenMode}>🖼️</button>
+            <button onClick={() => fileInputRef.current?.click()} className="px-3 bg-gray-900 border border-gray-700 text-gray-400 rounded hover:text-cyan-400 hover:border-cyan-500 transition-colors" title="Upload Image" disabled={isImageGenMode || isLiveMode}>🖼️</button>
 
             <input
               type="text"
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSendMessage()}
-              placeholder={isImageGenMode ? `Describe image (${imageSize})...` : (settings.showThinking ? "Deep Thought Active..." : "Input directive...")}
-              className={`flex-1 px-4 py-3 rounded-md focus:outline-none focus:border-cyan-500 focus:shadow-[0_0_15px_rgba(6,182,212,0.1)] font-mono text-sm border ${isImageGenMode ? 'bg-indigo-950/40 border-indigo-500 text-indigo-100 placeholder-indigo-400/50' : settings.showThinking ? 'bg-purple-950/20 border-purple-800 text-purple-100 placeholder-purple-400/50' : 'bg-black/50 border-gray-800 text-gray-200'}`}
-              disabled={isProcessing}
+              placeholder={isLiveMode ? "Listening..." : (isImageGenMode ? `Describe image (${imageSize})...` : (settings.showThinking ? "Deep Thought Active..." : "Input directive..."))}
+              className={`flex-1 px-4 py-3 rounded-md focus:outline-none focus:border-cyan-500 focus:shadow-[0_0_15px_rgba(6,182,212,0.1)] font-mono text-sm border ${isImageGenMode ? 'bg-indigo-950/40 border-indigo-500 text-indigo-100 placeholder-indigo-400/50' : isLiveMode ? 'bg-red-950/20 border-red-800 text-red-200 placeholder-red-400/50' : settings.showThinking ? 'bg-purple-950/20 border-purple-800 text-purple-100 placeholder-purple-400/50' : 'bg-black/50 border-gray-800 text-gray-200'}`}
+              disabled={isProcessing || isLiveMode}
             />
             {isProcessing ? (
               <button onClick={() => { setStopSignal(true); setIsProcessing(false); }} className="px-6 bg-red-900/20 border border-red-500 text-red-500 rounded hover:bg-red-900/40 transition">⏹️</button>
             ) : (
-              <button onClick={() => handleSendMessage()} className={`px-6 border rounded transition ${isImageGenMode ? 'bg-indigo-700 border-indigo-400 text-white' : settings.showThinking ? 'bg-purple-900/40 border-purple-500 text-purple-300' : 'bg-cyan-900/20 border-cyan-600 text-cyan-400'}`}>SEND</button>
+              <button onClick={() => handleSendMessage()} disabled={isLiveMode} className={`px-6 border rounded transition ${isLiveMode ? 'bg-gray-800 border-gray-700 text-gray-500 cursor-not-allowed' : (isImageGenMode ? 'bg-indigo-700 border-indigo-400 text-white' : settings.showThinking ? 'bg-purple-900/40 border-purple-500 text-purple-300' : 'bg-cyan-900/20 border-cyan-600 text-cyan-400')}`}>SEND</button>
             )}
           </div>
           <div className="text-[10px] text-gray-600 mt-2 font-mono flex justify-between">
             <span>AFFINITY: {affinity.score.toFixed(1)}%</span>
-            <span>{settings.showThinking ? 'MODE: DEEP_REASONING' : 'MODE: STANDARD'}</span>
+            <span>{isLiveMode ? 'MODE: LIVE_AUDIO' : (settings.showThinking ? 'MODE: DEEP_REASONING' : 'MODE: STANDARD')}</span>
           </div>
         </div>
       </div>
@@ -642,7 +857,6 @@ const App: React.FC = () => {
             {messages.slice().reverse().find(m => m.isCoT && m.cotSteps)?.cotSteps?.map((step, i) => (<div key={i} className="p-2 border-l-2 border-purple-800 bg-purple-900/10 text-xs text-purple-200"><span className="text-purple-500 font-bold mr-1">{i+1}:</span> {step.replace(/^\d+\.\s*/, '').replace(/^Step \d+:\s*/, '')}</div>))}
          </div>
       </div>
-      {!isRightSidebarOpen && <button onClick={() => setIsRightSidebarOpen(true)} className="absolute top-4 right-4 z-10 p-2 bg-gray-900 border border-gray-700 rounded hover:border-purple-500 text-purple-400">🧠</button>}
 
       {/* OVERLAYS */}
       {activePanel === 'store' && (
@@ -680,7 +894,7 @@ const App: React.FC = () => {
       
       {activePanel === 'folder' && (<div className="absolute inset-0 z-50 bg-black/90 backdrop-blur-sm flex items-center justify-center"><div className="w-full max-w-lg bg-gray-950 border border-cyan-900 rounded-lg p-6 shadow-2xl relative"><button onClick={() => setActivePanel(null)} className="absolute top-4 right-4 text-gray-500 hover:text-white">✕</button><h2 className="text-xl font-mono text-cyan-500 mb-6">📂 DATA_BANKS</h2><div className="space-y-2 max-h-96 overflow-y-auto">{checkpoints.length === 0 ? <p className="text-gray-600 text-sm">No saved data found.</p> : checkpoints.map((cp, i) => (<div key={i} className="flex justify-between items-center p-3 border border-gray-800 rounded hover:bg-gray-900"><div><div className="text-sm font-bold text-gray-300">{cp.name}</div><div className="text-xs text-gray-500">{new Date(cp.timestamp).toLocaleDateString()}</div></div><button onClick={() => { loadCheckpoint(cp.name); setActivePanel(null); }} className="text-xs bg-cyan-900/30 text-cyan-400 px-3 py-1 hover:bg-cyan-900/60 rounded">LOAD</button></div>))}</div></div></div>)}
       <SettingsPanel isOpen={activePanel === 'settings'} type="settings" onClose={() => setActivePanel(null)} settings={settings} onSettingsChange={setSettings} history={messages} checkpoints={checkpoints} onLoadCheckpoint={loadCheckpoint} logs={logs} />
-      {masterHiddenOpen && (<div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/95"><div className="w-96 border border-red-500 p-6 rounded bg-red-950/10"><h2 className="text-red-500 font-mono text-xl mb-4">MASTER_CONTROLS</h2><button onClick={() => setMasterHiddenOpen(false)} className="w-full bg-red-600 text-black p-2 text-sm font-bold mt-4">CLOSE</button></div></div>)}
+      {masterHiddenOpen && (<div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/95"><div className="w-96 border border-red-500 p-6 rounded bg-red-950/10"><h2 className="text-red-500 font-mono text-xl mb-4">MASTER_CONTROLS</h2><div className="space-y-4"><div className="flex gap-2"><input type="number" placeholder="Add Money..." className="flex-1 bg-black border border-red-900 text-red-100 p-2 text-sm" onKeyDown={(e) => {if(e.key==='Enter') { setCurrency(c => c + parseInt((e.target as HTMLInputElement).value)); (e.target as HTMLInputElement).value = ''; }}} /><button className="bg-red-900 text-white px-4 text-xs font-bold" onClick={(e) => { const input = e.currentTarget.previousElementSibling as HTMLInputElement; setCurrency(c => c + parseInt(input.value || '0')); input.value=''; }}>ADD</button></div><div className="flex gap-2"><input type="number" placeholder="Set Affinity (0-100)..." className="flex-1 bg-black border border-red-900 text-red-100 p-2 text-sm" onKeyDown={(e) => {if(e.key==='Enter') { setAffinity(a => ({...a, score: parseInt((e.target as HTMLInputElement).value)})); (e.target as HTMLInputElement).value = ''; }}} /><button className="bg-red-900 text-white px-4 text-xs font-bold" onClick={(e) => { const input = e.currentTarget.previousElementSibling as HTMLInputElement; setAffinity(a => ({...a, score: parseInt(input.value || '0')})); input.value=''; }}>SET</button></div></div><button onClick={() => setMasterHiddenOpen(false)} className="w-full bg-red-600 text-black p-2 text-sm font-bold mt-4 hover:bg-red-500">CLOSE</button></div></div>)}
     </div>
   );
 };

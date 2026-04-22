@@ -3,5 +3,6 @@
   "description": "A high-precision AI interface with affinity tracking, MoE agents, and nanite-styled visual synthesis.",
   "requestFramePermissions": [
     "microphone"
-  ]
+  ],
+  "majorCapabilities": []
 }
